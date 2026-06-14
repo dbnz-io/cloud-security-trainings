@@ -1,0 +1,140 @@
+service: aws-purple-demo
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.12
+  region: us-east-1
+  stage: dev
+
+functions:
+  cloudtrailProcessor:
+    handler: handler.process_cloudtrail_event
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - aws.sts
+            detail-type:
+              - AWS API Call via CloudTrail
+            detail:
+              eventSource:
+                - sts.amazonaws.com
+              eventName:
+                - GetCallerIdentity
+
+resources:
+  Resources:
+    DemoVpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.10.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+
+    DemoInternetGateway:
+      Type: AWS::EC2::InternetGateway
+
+    DemoVpcGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: !Ref DemoVpc
+        InternetGatewayId: !Ref DemoInternetGateway
+
+    DemoPublicSubnet:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref DemoVpc
+        CidrBlock: 10.10.1.0/24
+        MapPublicIpOnLaunch: true
+        AvailabilityZone: !Select [0, !GetAZs ""]
+
+    DemoRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref DemoVpc
+
+    DemoDefaultRoute:
+      Type: AWS::EC2::Route
+      DependsOn: DemoVpcGatewayAttachment
+      Properties:
+        RouteTableId: !Ref DemoRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: !Ref DemoInternetGateway
+
+    DemoSubnetRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref DemoPublicSubnet
+        RouteTableId: !Ref DemoRouteTable
+
+    DemoSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Demo ECS task security group
+        VpcId: !Ref DemoVpc
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    DemoEcsCluster:
+      Type: AWS::ECS::Cluster
+      Properties:
+        ClusterName: aws-purple-demo-cluster
+
+    DemoEcsTaskExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ecs-tasks.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+    DemoEcsLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: /ecs/aws-purple-demo
+        RetentionInDays: 7
+
+    DemoTaskDefinition:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        Family: aws-purple-demo-task
+        RequiresCompatibilities:
+          - FARGATE
+        NetworkMode: awsvpc
+        Cpu: "256"
+        Memory: "512"
+        ExecutionRoleArn: !GetAtt DemoEcsTaskExecutionRole.Arn
+        ContainerDefinitions:
+          - Name: demo-container
+            Image: public.ecr.aws/docker/library/busybox:latest
+            Essential: true
+            Command:
+              - sh
+              - -c
+              - "echo Hello from ECS Fargate; sleep 300"
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: /ecs/aws-purple-demo
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: demo
+
+  Outputs:
+    EcsClusterName:
+      Value: !Ref DemoEcsCluster
+    TaskDefinitionArn:
+      Value: !Ref DemoTaskDefinition
+    PublicSubnetId:
+      Value: !Ref DemoPublicSubnet
+    SecurityGroupId:
+      Value: !Ref DemoSecurityGroup
