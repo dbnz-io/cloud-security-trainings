@@ -1,0 +1,47 @@
+# Serverless Framework
+.serverless/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Node (serverless plugins)
+node_modules/
+package-lock.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Terraform (in case it's added later)
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+
+# AWS
+.aws-sam/
+samconfig.toml
