@@ -22,4 +22,6 @@ Each folder contains the presentation slides (PDF) and any demo code or IaC used
 
 ## License
 
-Materials are shared for educational purposes. Please credit the original author if you reference or reuse any content.
+Licensed under the [Apache License, Version 2.0](LICENSE). All materials are provided "AS IS" without warranties of any kind.
+
+These materials may reference third-party tools, services, or content. If you believe any material in this repository infringes on your copyright, please open an issue or contact the author so it can be promptly addressed.
